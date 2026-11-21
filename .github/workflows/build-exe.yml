@@ -1,0 +1,125 @@
+name: Build Windows EXE
+
+# Build-only file: the app code in this repo is a verbatim copy of upstream
+# PeakCut. This workflow packages it as a Windows folder (onedir) with
+# PyInstaller. No app code is changed here.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Fetch ffmpeg
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-dl
+          $ffdir = Get-ChildItem -Directory ffmpeg-dl | Select-Object -First 1
+          Copy-Item "$($ffdir.FullName)/bin/ffmpeg.exe" -Destination ffmpeg.exe
+          Copy-Item "$($ffdir.FullName)/bin/ffprobe.exe" -Destination ffprobe.exe
+
+      - name: Generate launcher and runtime hook
+        run: |
+          @'
+          from studio.server import main
+
+          if __name__ == "__main__":
+              main()
+          '@ | Set-Content -Path peakcut_main.py -Encoding utf8
+          @'
+          import os
+          import sys
+
+          _base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+          _exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+          # ffmpeg/ffprobe ride in the bundle dir: let bare-name calls find them.
+          os.environ["PATH"] = _base + os.pathsep + os.environ.get("PATH", "")
+          # Load a .env placed next to the exe (frozen ROOT may resolve inside
+          # _internal, where a user .env would never be seen).
+          try:
+              _dotenv = os.path.join(_exe_dir, ".env")
+              if os.path.isfile(_dotenv):
+                  with open(_dotenv, encoding="utf-8") as _f:
+                      for _line in _f:
+                          _line = _line.strip()
+                          if _line and not _line.startswith("#") and "=" in _line:
+                              _k, _v = _line.split("=", 1)
+                              os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+          except OSError:
+              pass
+          # Keep user data next to the exe, never inside _internal.
+          os.environ.setdefault("PEAKCUT_DATA", os.path.join(_exe_dir, "data"))
+          os.environ.setdefault("PEAKCUT_STORAGE_FILE", os.path.join(_exe_dir, "storage.json"))
+          '@ | Set-Content -Path peakcut_hook.py -Encoding utf8
+
+      - name: Build with PyInstaller (onedir)
+        run: |
+          pyinstaller --noconfirm --clean --onedir --name PeakCut `
+            --add-data "web;web" --add-data "web;_internal/web" `
+            --add-data "studio/fonts;studio/fonts" --add-data "studio/fonts;_internal/studio/fonts" `
+            --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." `
+            --collect-all sherpa_onnx --collect-all onnxruntime `
+            --collect-all uvicorn --collect-all fastapi --collect-all starlette `
+            --collect-all sqlalchemy --collect-all yt_dlp --collect-all PIL `
+            --collect-all pydantic --collect-all anyio --collect-all httpx `
+            --collect-all numpy --collect-all soundfile `
+            --collect-all psycopg --collect-all psycopg_binary `
+            --collect-submodules studio `
+            --hidden-import multipart `
+            --runtime-hook peakcut_hook.py `
+            peakcut_main.py
+
+      - name: Smoke test (boot and serve the landing page)
+        run: |
+          $env:PEAKCUT_DATA = "$env:RUNNER_TEMP\peakcut-smoke"
+          $env:PEAKCUT_PORT = "8766"
+          $proc = Start-Process -FilePath "dist\PeakCut\PeakCut.exe" -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\peakcut-boot.log" -RedirectStandardError "$env:RUNNER_TEMP\peakcut-boot-err.log"
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:8766/" -UseBasicParsing -TimeoutSec 5
+                if ($r.StatusCode -eq 200) { $ok = $true; break }
+              } catch { }
+              if ($proc.HasExited) { break }
+            }
+            if (-not $ok) { Get-Content "$env:RUNNER_TEMP\peakcut-boot.log" -ErrorAction SilentlyContinue; Get-Content "$env:RUNNER_TEMP\peakcut-boot-err.log" -ErrorAction SilentlyContinue; throw "Smoke test failed: landing page did not answer 200" }
+          } finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+      - name: Zip the folder
+        run: |
+          Compress-Archive -Path dist/PeakCut -DestinationPath PeakCut-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PeakCut-Windows
+          path: PeakCut-Windows.zip
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $tag = "exe-$sha"
+          gh release create $tag PeakCut-Windows.zip --title "PeakCut Windows EXE ($tag)" --notes "Verbatim PeakCut build. Unzip to a short folder such as C:\peakcut, double-click PeakCut.exe, then open http://127.0.0.1:8765. The first start downloads the 480 MB English speech model by itself. No AI key is needed for loudness-only clips; add a key in Settings, AI for AI-picked clips."
